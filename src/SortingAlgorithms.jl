@@ -42,6 +42,27 @@ end
 
 ## Radix sort
 
+struct PermElement{T}
+    x::T
+    i::Int
+end
+
+struct PermVector{V, P, T} <: AbstractVector{PermElement{T}}
+    v::V
+    perm::P
+end
+PermVector(v::AbstractVector{T}, perm::AbstractVector) where {T} =
+    PermVector{typeof(v), typeof(perm), T}(v, perm)
+
+Base.@propagate_inbounds Base.getindex(v::PermVector, i::Int) =
+    PermElement(v.v[i], v.perm[i])
+Base.@propagate_inbounds function Base.setindex!(v::PermVector, x::PermElement, i::Int)
+    v.v[i] = x.x
+    v.perm[i] = x.i
+    return x
+end
+Base.size(v::PermVector) = size(v.v)
+
 # Map a bits-type to an unsigned int, maintaining sort order
 uint_mapping(::ForwardOrdering, x::Unsigned) = x
 for (signedty, unsignedty) in ((Int8, UInt8), (Int16, UInt16), (Int32, UInt32), (Int64, UInt64), (Int128, UInt128))
@@ -50,23 +71,26 @@ for (signedty, unsignedty) in ((Int8, UInt8), (Int16, UInt16), (Int32, UInt32), 
 end
 uint_mapping(::ForwardOrdering, x::Float32)  = (y = reinterpret(Int32, x); reinterpret(UInt32, ifelse(y < 0, ~y, xor(y, typemin(Int32)))))
 uint_mapping(::ForwardOrdering, x::Float64)  = (y = reinterpret(Int64, x); reinterpret(UInt64, ifelse(y < 0, ~y, xor(y, typemin(Int64)))))
+uint_mapping(o::ForwardOrdering, x::PermElement) = uint_mapping(o, x.x)
 
 uint_mapping(rev::ReverseOrdering, x) = ~uint_mapping(rev.fwd, x)
 uint_mapping(::ReverseOrdering{ForwardOrdering}, x::Real) = ~uint_mapping(Forward, x) # maybe unnecessary; needs benchmark
 
-uint_mapping(o::By,   x     ) = uint_mapping(Forward, o.by(x))
+uint_mapping(o::By, x) = uint_mapping(Forward, o.by(x))
+uint_mapping(o::By, x::PermElement) = uint_mapping(Forward, o.by(x.x))
 uint_mapping(o::Perm, i::Int) = uint_mapping(o.order, o.data[i])
-uint_mapping(o::Lt,   x     ) = error("uint_mapping does not work with general Lt Orderings")
+uint_mapping(o::Lt, x) = error("uint_mapping does not work with general Lt Orderings")
 
 const RADIX_SIZE = 11
 const RADIX_MASK = 0x7FF
 
-function sort!(vs::AbstractVector, lo::Int, hi::Int, ::RadixSortAlg, o::Ordering, ts=similar(vs))
+function sort!(vs::AbstractVector, lo::Int, hi::Int, ::RadixSortAlg, o::Ordering,
+               ts::AbstractVector=similar(vs))
     # Input checking
     if lo >= hi;  return vs;  end
 
     # Make sure we're sorting a bits type
-    T = Base.Order.ordtype(o, vs)
+    T = vs isa PermVector ? Base.Order.ordtype(o, vs.v) : Base.Order.ordtype(o, vs)
     if !isbitstype(T)
         error("Radix sort only sorts bits types (got $T)")
     end
@@ -125,6 +149,37 @@ end
 function Base.Sort.Float.fpsort!(v::AbstractVector, ::RadixSortAlg, o::Ordering)
     lo, hi = Base.Sort.Float.nans2end!(v,o)
     sort!(v, lo, hi, RadixSort, o)
+end
+
+function Base.Sort.Float.fpsort!(v::AbstractVector, ::RadixSortAlg, o::Perm)
+    lo, hi = Base.Sort.Float.nans2end!(v,o)
+    # Sorting data at the same time as indices is faster for vectors that do not fit in CPU cache
+    # Better use a low threshold as the penalty is very high in that case
+    if sizeof(v) > 2_000_000
+        sort!(PermVector(o.data[v], v), lo, hi, RadixSort, o.order,
+              PermVector(similar(o.data), similar(v)))
+    else
+        invoke(sort!,
+               Tuple{AbstractVector, Int, Int, RadixSortAlg, Ordering},
+               v, lo, hi, RadixSort, o)
+    end
+    return v
+end
+
+function sort!(vs::AbstractVector, lo::Int, hi::Int, ::RadixSortAlg, o::Perm,
+               ts::AbstractVector)
+    # Sorting data at the same time as indices is faster for vectors that do not fit in CPU cache
+    # Better use a low threshold as the penalty is very high in that case
+    # Int8 and UInt8 do not benefit from this
+    if !(eltype(o.data) <: Union{Int8, UInt}) && sizeof(vs) > 2_000_000
+        sort!(PermVector(copy(o.data), vs), lo, hi, RadixSort, o.order,
+              PermVector(similar(o.data), similar(vs)))
+    else
+        invoke(sort!,
+               Tuple{AbstractVector, Int, Int, RadixSortAlg, Ordering, AbstractVector},
+               vs, lo, hi, RadixSort, o, ts)
+    end
+    return vs
 end
 
 
